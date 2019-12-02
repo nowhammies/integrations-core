@@ -1,14 +1,16 @@
-# (C) Datadog, Inc. 2018
+# (C) Datadog, Inc. 2018-2019
 # All rights reserved
 # Licensed under a 3-clause BSD style license (see LICENSE)
+import re
+
 import mock
 import pytest
 import requests
 
 from datadog_checks.vault import Vault
-from datadog_checks.vault.errors import ApiUnreachable
 
 from .common import INSTANCES, MockResponse
+from .utils import run_check
 
 pytestmark = pytest.mark.usefixtures('dd_environment')
 
@@ -17,7 +19,9 @@ class TestVault:
     def test_bad_config(self, aggregator):
         instance = INSTANCES['invalid']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-        c.check(instance)
+
+        with pytest.raises(Exception, match='^Vault setting `api_url` is required$'):
+            run_check(c, extract_message=True)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_CONNECT, count=0)
 
@@ -26,16 +30,15 @@ class TestVault:
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
         assert not instance['api_url'].endswith(Vault.DEFAULT_API_VERSION)
-        config = c.get_config(instance)
-        assert config['api_url'].endswith(Vault.DEFAULT_API_VERSION)
+        run_check(c)
+        assert c._api_url.endswith(Vault.DEFAULT_API_VERSION)
 
-        c.check(instance)
         aggregator.assert_service_check(Vault.SERVICE_CHECK_CONNECT, status=Vault.OK, count=1)
 
     def test_service_check_connect_ok(self, aggregator):
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-        c.check(instance)
+        run_check(c)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_CONNECT, status=Vault.OK, count=1)
 
@@ -43,17 +46,15 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': True, 'leader_address': '', 'leader_cluster_address': ''}
                 )
-            elif url == config['api_url'] + '/sys/health':
+            elif url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -70,7 +71,7 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         expected_tags = [
             'instance:foobar',
@@ -83,8 +84,12 @@ class TestVault:
     def test_service_check_connect_fail(self, aggregator):
         instance = INSTANCES['bad_url']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-        with pytest.raises(ApiUnreachable):
-            c.check(instance)
+
+        with pytest.raises(
+            Exception,
+            match=r'^Vault endpoint `{}.+?` timed out after 1\.0 seconds$'.format(re.escape(instance['api_url'])),
+        ):
+            run_check(c, extract_message=True)
 
         aggregator.assert_service_check(
             Vault.SERVICE_CHECK_CONNECT, status=Vault.CRITICAL, tags=['instance:foobar'], count=1
@@ -94,9 +99,11 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        with pytest.raises(ApiUnreachable):
-            with mock.patch('requests.get', return_value=MockResponse('', status_code=500)):
-                c.check(instance)
+        with mock.patch('requests.get', return_value=MockResponse('', status_code=500)):
+            with pytest.raises(
+                Exception, match=r'^The Vault endpoint `{}.+?` returned 500$'.format(re.escape(instance['api_url'])),
+            ):
+                run_check(c, extract_message=True)
 
         aggregator.assert_service_check(
             Vault.SERVICE_CHECK_CONNECT, status=Vault.CRITICAL, tags=['instance:foobar'], count=1
@@ -105,7 +112,7 @@ class TestVault:
     def test_service_check_unsealed_ok(self, aggregator):
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-        c.check(instance)
+        run_check(c)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_UNSEALED, status=Vault.OK, count=1)
 
@@ -113,17 +120,15 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': True, 'leader_address': '', 'leader_cluster_address': ''}
                 )
-            elif url == config['api_url'] + '/sys/health':
+            elif url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -140,7 +145,7 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         expected_tags = [
             'instance:foobar',
@@ -154,13 +159,11 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/health':
+            if url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -178,14 +181,14 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_UNSEALED, status=Vault.CRITICAL, count=1)
 
     def test_service_check_initialized_ok(self, aggregator):
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-        c.check(instance)
+        run_check(c)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_INITIALIZED, status=Vault.OK, count=1)
 
@@ -193,17 +196,15 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': True, 'leader_address': '', 'leader_cluster_address': ''}
                 )
-            elif url == config['api_url'] + '/sys/health':
+            elif url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -220,7 +221,7 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         expected_tags = [
             'instance:foobar',
@@ -234,13 +235,11 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/health':
+            if url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -258,29 +257,27 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         aggregator.assert_service_check(Vault.SERVICE_CHECK_INITIALIZED, status=Vault.CRITICAL, count=1)
 
     def test_event_leader_change(self, aggregator):
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
-
-        config = c.get_config(instance)
-        config['leader'] = 'foo'
+        c._previous_leader = 'foo'
 
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': True, 'leader_address': 'bar', 'leader_cluster_address': ''}
                 )
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         assert len(aggregator.events) > 0
 
@@ -297,20 +294,18 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': True, 'leader_address': 'bar', 'leader_cluster_address': ''}
                 )
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         aggregator.assert_metric('vault.is_leader', 1)
 
@@ -318,20 +313,18 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse(
                     {'ha_enabled': False, 'is_self': False, 'leader_address': 'bar', 'leader_cluster_address': ''}
                 )
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
 
         aggregator.assert_metric('vault.is_leader', 0)
 
@@ -340,13 +333,11 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/health':
+            if url == instance['api_url'] + '/sys/health':
                 return MockResponse(
                     {
                         'cluster_id': '9e25ccdb-09ea-8bd8-0521-34cf3ef7a4cc',
@@ -365,7 +356,8 @@ class TestVault:
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
+
         aggregator.assert_metric('vault.is_leader', 1)
         aggregator.assert_all_metrics_covered()
 
@@ -373,16 +365,15 @@ class TestVault:
         instance = INSTANCES['main']
         c = Vault(Vault.CHECK_NAME, {}, [instance])
 
-        config = c.get_config(instance)
-
         # Keep a reference for use during mock
         requests_get = requests.get
 
         def mock_requests_get(url, *args, **kwargs):
-            if url == config['api_url'] + '/sys/leader':
+            if url == instance['api_url'] + '/sys/leader':
                 return MockResponse({'errors': ["Vault is sealed"]}, status_code=503)
             return requests_get(url, *args, **kwargs)
 
         with mock.patch('requests.get', side_effect=mock_requests_get, autospec=True):
-            c.check(instance)
+            run_check(c)
+
         aggregator.assert_metric('vault.is_leader', count=0)

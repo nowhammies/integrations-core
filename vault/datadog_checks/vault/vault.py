@@ -1,26 +1,33 @@
-# (C) Datadog, Inc. 2018
+# (C) Datadog, Inc. 2018-2019
 # All rights reserved
 # Licensed under a 3-clause BSD style license (see LICENSE)
-
+from collections import namedtuple
 from time import time as timestamp
 
 import requests
-from simplejson import JSONDecodeError
 
-from datadog_checks.checks import AgentCheck
-from datadog_checks.config import is_affirmative
-from datadog_checks.utils.containers import hash_mutable
+from datadog_checks.base import ConfigurationError, OpenMetricsBaseCheck, is_affirmative
 
 from .errors import ApiUnreachable
+from .metrics import METRIC_MAP
+
+try:
+    from json import JSONDecodeError
+except ImportError:
+    from simplejson import JSONDecodeError
+
+Api = namedtuple('Api', ('check_health', 'check_leader'))
 
 
-class Vault(AgentCheck):
+class Vault(OpenMetricsBaseCheck):
+    DEFAULT_METRIC_LIMIT = 0
     CHECK_NAME = 'vault'
     DEFAULT_API_VERSION = '1'
     EVENT_LEADER_CHANGE = 'vault.leader_change'
     SERVICE_CHECK_CONNECT = 'vault.can_connect'
     SERVICE_CHECK_UNSEALED = 'vault.unsealed'
     SERVICE_CHECK_INITIALIZED = 'vault.initialized'
+    API_METHODS = ('check_health', 'check_leader')
 
     HTTP_CONFIG_REMAPPER = {
         'ssl_verify': {'name': 'tls_verify'},
@@ -33,49 +40,70 @@ class Vault(AgentCheck):
     # Expected HTTP Error codes for /sys/health endpoint
     # https://www.vaultproject.io/api/system/health.html
     SYS_HEALTH_DEFAULT_CODES = {
-        200,  # "initialized, unsealed, and active",
-        429,  # "unsealed and standby",
-        472,  # "data recovery mode replication secondary and active",
-        473,  # "performance standby",
-        501,  # "not initialized",
-        503,  # "sealed",
+        200,  # initialized, unsealed, and active
+        429,  # unsealed and standby
+        472,  # data recovery mode replication secondary and active
+        473,  # performance standby
+        501,  # not initialized
+        503,  # sealed
     }
 
-    SYS_LEADER_DEFAULT_CODES = {503}  # "sealed"
+    SYS_LEADER_DEFAULT_CODES = {503}  # sealed
 
     def __init__(self, name, init_config, instances):
-        super(Vault, self).__init__(name, init_config, instances)
-        self.api_versions = {
-            '1': {'functions': {'check_leader': self.check_leader_v1, 'check_health': self.check_health_v1}}
-        }
-        self.config = {}
-        if 'client_token' in self.instance:
-            self.http.options['headers']['X-Vault-Token'] = self.instance['client_token']
+        super(Vault, self).__init__(
+            name,
+            init_config,
+            instances,
+            default_instances={self.CHECK_NAME: {'namespace': self.CHECK_NAME, 'metrics': [METRIC_MAP]}},
+            default_namespace=self.CHECK_NAME,
+        )
 
-    def check(self, instance):
-        config = self.get_config(instance)
-        if config is None:
-            return
+        self._api_url = self.instance.get('api_url', '')
+        self._client_token = self.instance.get('client_token')
+        self._client_token_path = self.instance.get('client_token_path')
+        self._tags = self.instance.get('tags', [])
 
-        api = config['api']
-        tags = list(config['tags'])
+        # Keep track of the previous cluster leader to detect changes
+        self._previous_leader = None
+        self._detect_leader = is_affirmative(self.instance.get('detect_leader', False))
 
-        # We access the version of the Vault API corresponding to each instance's `api_url`.
-        try:
-            api['check_leader'](config, tags)
-            api['check_health'](config, tags)
-        except ApiUnreachable:
-            raise
+        # Determine the appropriate methods later
+        self._api = None
 
-        self.service_check(self.SERVICE_CHECK_CONNECT, AgentCheck.OK, tags=tags)
+        # Only collect OpenMetrics if we are given tokens
+        self._scraper_config = None
 
-    def check_leader_v1(self, config, tags):
-        url = config['api_url'] + '/sys/leader'
-        leader_data = self.access_api(url, tags, ignore_status_codes=Vault.SYS_LEADER_DEFAULT_CODES)
+        self.check_initializations.append(self.parse_config)
+
+    def check(self, _):
+        # raise Exception(self._client_token)
+        tags = list(self._tags)
+
+        # We access the version of the Vault API corresponding to the instance's `api_url`
+        self._api.check_leader(tags)
+        self._api.check_health(tags)
+
+        if self._client_token:
+            try:
+                self.process(self._scraper_config)
+            except Exception as e:
+                if self._client_token_path and str(e).startswith('403 Client Error: Forbidden for url'):
+                    self.log.error('Permission denied, refreshing the client token...')
+                    self.renew_client_token()
+                    return
+
+                raise
+
+        self.service_check(self.SERVICE_CHECK_CONNECT, self.OK, tags=tags)
+
+    def check_leader_v1(self, tags):
+        url = self._api_url + '/sys/leader'
+        leader_data = self.access_api(url, tags, ignore_status_codes=self.SYS_LEADER_DEFAULT_CODES)
         errors = leader_data.get('errors')
         if errors:
-            error_msg = ";".join(errors)
-            self.log.error("Unable to fetch leader data from vault. Reason: %s", error_msg)
+            error_msg = ';'.join(errors)
+            self.log.error('Unable to fetch leader data from vault. Reason: %s', error_msg)
             return
 
         is_leader = is_affirmative(leader_data.get('is_self'))
@@ -84,26 +112,25 @@ class Vault(AgentCheck):
         self.gauge('vault.is_leader', int(is_leader), tags=tags)
 
         current_leader = leader_data.get('leader_address')
-        previous_leader = config['leader']
-        if config['detect_leader'] and current_leader:
-            if previous_leader is not None and current_leader != previous_leader:
+        if self._detect_leader and current_leader:
+            if self._previous_leader is not None and current_leader != self._previous_leader:
                 self.event(
                     {
                         'timestamp': timestamp(),
                         'event_type': self.EVENT_LEADER_CHANGE,
                         'msg_title': 'Leader change',
-                        'msg_text': 'Leader changed from `{}` to `{}`.'.format(previous_leader, current_leader),
+                        'msg_text': 'Leader changed from `{}` to `{}`.'.format(self._previous_leader, current_leader),
                         'alert_type': 'info',
                         'source_type_name': self.CHECK_NAME,
                         'host': self.hostname,
                         'tags': tags,
                     }
                 )
-            config['leader'] = current_leader
+            self._previous_leader = current_leader
 
-    def check_health_v1(self, config, tags):
-        url = config['api_url'] + '/sys/health'
-        health_data = self.access_api(url, tags, ignore_status_codes=Vault.SYS_HEALTH_DEFAULT_CODES)
+    def check_health_v1(self, tags):
+        url = self._api_url + '/sys/health'
+        health_data = self.access_api(url, tags, ignore_status_codes=self.SYS_HEALTH_DEFAULT_CODES)
 
         cluster_name = health_data.get('cluster_name')
         if cluster_name:
@@ -115,47 +142,15 @@ class Vault(AgentCheck):
 
         unsealed = not is_affirmative(health_data.get('sealed'))
         if unsealed:
-            self.service_check(self.SERVICE_CHECK_UNSEALED, AgentCheck.OK, tags=tags)
+            self.service_check(self.SERVICE_CHECK_UNSEALED, self.OK, tags=tags)
         else:
-            self.service_check(self.SERVICE_CHECK_UNSEALED, AgentCheck.CRITICAL, tags=tags)
+            self.service_check(self.SERVICE_CHECK_UNSEALED, self.CRITICAL, tags=tags)
 
         initialized = is_affirmative(health_data.get('initialized'))
         if initialized:
-            self.service_check(self.SERVICE_CHECK_INITIALIZED, AgentCheck.OK, tags=tags)
+            self.service_check(self.SERVICE_CHECK_INITIALIZED, self.OK, tags=tags)
         else:
-            self.service_check(self.SERVICE_CHECK_INITIALIZED, AgentCheck.CRITICAL, tags=tags)
-
-    def get_config(self, instance):
-        instance_id = hash_mutable(instance)
-        config = self.config.get(instance_id)
-        if config is None:
-            config = {}
-
-            try:
-                api_url = instance['api_url']
-                api_version = api_url[-1]
-                if api_version not in self.api_versions:
-                    self.log.warning(
-                        'Unknown Vault API version `%s`, using version `%s`', api_version, self.DEFAULT_API_VERSION
-                    )
-                    api_url = api_url[:-1] + self.DEFAULT_API_VERSION
-                    api_version = self.DEFAULT_API_VERSION
-
-                config['api_url'] = api_url
-                config['api'] = self.api_versions[api_version]['functions']
-            except KeyError:
-                self.log.error('Vault configuration setting `api_url` is required')
-                return
-
-            config['tags'] = instance.get('tags', [])
-
-            # Keep track of the previous cluster leader to detect changes.
-            config['leader'] = None
-            config['detect_leader'] = is_affirmative(instance.get('detect_leader'))
-
-            self.config[instance_id] = config
-
-        return config
+            self.service_check(self.SERVICE_CHECK_INITIALIZED, self.CRITICAL, tags=tags)
 
     def access_api(self, url, tags, ignore_status_codes=None):
         if ignore_status_codes is None:
@@ -166,24 +161,62 @@ class Vault(AgentCheck):
             status_code = response.status_code
             if status_code >= 400 and status_code not in ignore_status_codes:
                 msg = 'The Vault endpoint `{}` returned {}'.format(url, status_code)
-                self.service_check(self.SERVICE_CHECK_CONNECT, AgentCheck.CRITICAL, message=msg, tags=tags)
-                self.log.exception(msg)
-                raise ApiUnreachable
+                self.service_check(self.SERVICE_CHECK_CONNECT, self.CRITICAL, message=msg, tags=tags)
+                raise ApiUnreachable(msg)
             json_data = response.json()
         except JSONDecodeError:
             msg = 'The Vault endpoint `{}` returned invalid json data.'.format(url)
-            self.service_check(self.SERVICE_CHECK_CONNECT, AgentCheck.CRITICAL, message=msg, tags=tags)
-            self.log.exception(msg)
-            raise ApiUnreachable
+            self.service_check(self.SERVICE_CHECK_CONNECT, self.CRITICAL, message=msg, tags=tags)
+            raise ApiUnreachable(msg)
         except requests.exceptions.Timeout:
-            msg = 'Vault endpoint `{}` timed out after {} seconds'.format(url, self.http.options['timeout'])
-            self.service_check(self.SERVICE_CHECK_CONNECT, AgentCheck.CRITICAL, message=msg, tags=tags)
-            self.log.exception(msg)
-            raise ApiUnreachable
+            msg = 'Vault endpoint `{}` timed out after {} seconds'.format(url, self.http.options['timeout'][0])
+            self.service_check(self.SERVICE_CHECK_CONNECT, self.CRITICAL, message=msg, tags=tags)
+            raise ApiUnreachable(msg)
         except (requests.exceptions.RequestException, requests.exceptions.ConnectionError):
             msg = 'Error accessing Vault endpoint `{}`'.format(url)
-            self.service_check(self.SERVICE_CHECK_CONNECT, AgentCheck.CRITICAL, message=msg, tags=tags)
-            self.log.exception(msg)
-            raise ApiUnreachable
+            self.service_check(self.SERVICE_CHECK_CONNECT, self.CRITICAL, message=msg, tags=tags)
+            raise ApiUnreachable(msg)
 
         return json_data
+
+    def parse_config(self):
+        if not self._api_url:
+            raise ConfigurationError('Vault setting `api_url` is required')
+
+        api_version = self._api_url[-1]
+        if api_version not in ('1',):
+            self.log.warning(
+                'Unknown Vault API version `%s`, using version `%s`', api_version, self.DEFAULT_API_VERSION
+            )
+            api_version = self.DEFAULT_API_VERSION
+            self._api_url = self._api_url[:-1] + api_version
+
+        methods = {method: getattr(self, '{}_v{}'.format(method, api_version)) for method in self.API_METHODS}
+        self._api = Api(**methods)
+
+        if self._client_token_path:
+            self.renew_client_token()
+
+        if self._client_token:
+            instance = self.instance.copy()
+            instance['prometheus_url'] = '{}/sys/metrics?format=prometheus'.format(self._api_url)
+            self._scraper_config = self.create_scraper_configuration(instance)
+            self.set_client_token(self._client_token)
+
+    def set_client_token(self, client_token):
+        self._client_token = client_token
+        self.http.options['headers']['X-Vault-Token'] = client_token
+
+    def renew_client_token(self):
+        with open(self._client_token_path, 'rb') as f:
+            self.set_client_token(f.read().decode('utf-8'))
+
+    def poll(self, scraper_config, headers=None):
+        if self._client_token:
+            headers = {'X-Vault-Token': self._client_token}
+
+        return super(Vault, self).poll(scraper_config, headers=headers)
+
+    def get_scraper_config(self, instance):
+        # This validation is called during `__init__` but we don't need it
+        pass
